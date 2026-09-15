@@ -1,0 +1,37 @@
+# --- Core Math & Audio Processing ---
+numpy>=1.24.0,<2.0.0
+soundfile>=0.12.1
+pysrt>=1.1.2
+noisereduce>=3.0.0
+scipy>=1.11.0
+librosa>=0.10.0
+torchlibrosa
+
+# --- Neural Speech, Stem Separation & Super-Resolution ---
+faster-whisper>=1.0.0
+demucs>=4.0.0
+phonemizer
+ftfy
+unidecode
+progressbar>=2.5
+diffusers
+timm
+
+# --- Chatterbox & Model Architecture Dependencies ---
+perth>=1.0.0
+s3tokenizer>=0.3.0
+omegaconf>=2.3.1
+conformer>=0.3.2
+
+# --- Hugging Face Runtime (Pinned for Chatterbox compatibility) ---
+transformers==5.2.0
+safetensors>=0.5.3
+huggingface-hub>=0.24.0
+tokenizers>=0.19.1
+
+# --- Web UI & API Engine ---
+gradio>=5.0.0
+pandas>=2.0.0,<2.3.0
+anyio>=4.0.0
+fastapi>=0.112.0
+uvicorn>=0.30.0
