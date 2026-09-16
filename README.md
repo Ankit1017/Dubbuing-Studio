@@ -50,7 +50,7 @@ dubbing_studio/
 **PowerShell**
 
 ```
-git clone https://github.com/<YOUR_USERNAME>/<YOUR_REPOSITORY_NAME>.git
+git clone https://github.com/Ankit1017/Dubbuing-Studio.git
 cd dubbing_studio
 ```
 

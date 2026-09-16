@@ -2,17 +2,20 @@
 
 import concurrent.futures
 import datetime
+import gc
+import json
 import os
 import sys
 import time
-import torch
-import pandas as pd
-import gradio as gr
+import warnings
 from pathlib import Path
 
-import warnings
+import gradio as gr
+import pandas as pd
+import torch
+import numpy as np
+import soundfile as sf
 
-from safetensors.torch import load_file as load_safetensors, save_file as save_safetensors
 warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*")
 
 # Silence Windows Proactor Socket Drop Errors
@@ -52,10 +55,11 @@ from media_utils import (
 )
 from audio_engine import (
     get_vram_usage,
+    is_valid_file,
     resynthesize_single_cue,
+    super_resolve_timeline,
     synthesize_sentence_blocks,
     transcribe_video_audio,
-    super_resolve_timeline,
 )
 from ui_components import (
     STUDIO_CSS,
@@ -67,8 +71,17 @@ from ui_components import (
 
 def scan_voice_presets():
     valid_exts = (".wav", ".mp3", ".flac", ".ogg", ".m4a")
+    if not VOICES_DIR.exists():
+        VOICES_DIR.mkdir(parents=True, exist_ok=True)
     voices = [f.name for f in VOICES_DIR.iterdir() if f.suffix.lower() in valid_exts]
     return sorted(voices)
+
+
+def scan_saved_runs():
+    if not OUTPUTS_DIR.exists():
+        OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    runs = [str(p) for p in sorted(OUTPUTS_DIR.glob("run_*"), reverse=True) if p.is_dir()]
+    return runs
 
 
 def load_selected_voice_preview(selected_voice):
@@ -78,11 +91,49 @@ def load_selected_voice_preview(selected_voice):
     return str(voice_path) if voice_path.exists() else None
 
 
-def run_pipeline(video_file, voice_preset_name, custom_voice_file, temp, exag, cfg_w, seed_val, apply_eq):
+def run_pipeline(
+    run_mode,
+    resume_target_dir,
+    video_file,
+    voice_preset_name,
+    custom_voice_file,
+    temp,
+    exag,
+    cfg_w,
+    seed_val,
+    apply_eq,
+    enable_audiosr,
+):
     start_time = time.time()
 
-    if video_file is None:
-        raise gr.Error("Missing input video. Upload an MP4, MOV, or MKV file.")
+    # 1. Resolve Workspace Directory
+    if run_mode == "Resume Existing Run" and resume_target_dir and Path(resume_target_dir).is_dir():
+        run_dir = Path(resume_target_dir)
+    else:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = OUTPUTS_DIR / f"run_{timestamp}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+    cue_cache_dir = run_dir / "cues"
+    cue_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # 2. Resolve Inputs & Meta
+    session_meta_path = run_dir / "session_meta.json"
+    session_meta = {}
+    if is_valid_file(session_meta_path):
+        try:
+            with open(session_meta_path, "r", encoding="utf-8") as f:
+                session_meta = json.load(f)
+        except Exception:
+            session_meta = {}
+
+    if video_file is not None:
+        video_path = video_file.name if hasattr(video_file, "name") else str(video_file)
+        session_meta["video_path"] = video_path
+    elif "video_path" in session_meta and is_valid_file(session_meta["video_path"]):
+        video_path = session_meta["video_path"]
+    else:
+        raise gr.Error("Missing input video. Provide an MP4, MOV, or MKV file.")
 
     selected_voice_path = None
     if custom_voice_file is not None:
@@ -91,15 +142,18 @@ def run_pipeline(video_file, voice_preset_name, custom_voice_file, temp, exag, c
         preset_file = VOICES_DIR / voice_preset_name
         if preset_file.exists():
             selected_voice_path = str(preset_file)
+    elif "voice_path" in session_meta and is_valid_file(session_meta["voice_path"]):
+        selected_voice_path = session_meta["voice_path"]
 
     if not selected_voice_path:
         raise gr.Error("Missing voice reference. Select a preset or upload a WAV sample.")
 
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = OUTPUTS_DIR / f"run_{timestamp}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    session_meta["voice_path"] = selected_voice_path
+    session_meta["apply_eq"] = apply_eq
+    session_meta["enable_audiosr"] = enable_audiosr
 
-    video_path = video_file.name if hasattr(video_file, "name") else str(video_file)
+    with open(session_meta_path, "w", encoding="utf-8") as f:
+        json.dump(session_meta, f, indent=2)
 
     logs = []
     def log(msg):
@@ -107,11 +161,17 @@ def run_pipeline(video_file, voice_preset_name, custom_voice_file, temp, exag, c
         logs.append(f"[{t}] {msg}")
         return "\n".join(logs[-12:])
 
-    # 1. Probe & Demux
+    # -------------------------------------------------------------
+    # STAGE 1: DEMUX & DEMUCS STEM ISOLATION
+    # -------------------------------------------------------------
     _, _, aspect_label = probe_video_metadata(video_path)
+    extracted_audio = str(run_dir / "extracted_audio.wav")
+    vocals_stem = str(run_dir / "vocals.wav")
+    bg_stem = str(run_dir / "no_vocals.wav")
+
     yield (
-        "STAGE 1/4: AUDIO DEMUX",
-        "Demuxing audio stream from container...",
+        "STAGE 1/4: AUDIO DEMUX & STEMS",
+        "Inspecting cached media stems or demuxing...",
         render_hud_html("0/0", "0.0s", get_vram_usage(), aspect_label),
         "Awaiting transcription stream...",
         pd.DataFrame(columns=["Cue", "Timestamp", "Script Segment", "Window", "Duration", "WSOLA", "Peak", "Status"]),
@@ -119,56 +179,74 @@ def run_pipeline(video_file, voice_preset_name, custom_voice_file, temp, exag, c
         render_wavesurfer_component(""),
         gr.update(choices=[]),
         {},
-        log(f"Initialized output: outputs/run_{timestamp}\nProbed aspect: {aspect_label}. Extracting 16kHz PCM...")
+        log(f"Workspace: {run_dir.name}\nAspect detected: {aspect_label}")
     )
 
-    extracted_audio = str(run_dir / "extracted_audio.wav")
-    extract_audio_from_video(video_path, extracted_audio)
+    if not is_valid_file(extracted_audio):
+        extract_audio_from_video(video_path, extracted_audio)
+        log("[✓] Audio stream extracted from video container.")
+    else:
+        log("[Skipped] Using existing extracted_audio.wav.")
 
-    # Separate speech from original music/SFX
-    # Stage 1: Stem Separation
-    vocals_stem, bg_stem = separate_audio_stems(extracted_audio, run_dir)
+    if not (is_valid_file(vocals_stem) and is_valid_file(bg_stem)):
+        log("Engaging Demucs neural stem separator...")
+        vocals_stem, bg_stem = separate_audio_stems(extracted_audio, run_dir)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        log("[✓] Demucs stems generated.")
+    else:
+        log("[Skipped] Using existing isolated Demucs stems.")
 
-    # Force VRAM cleanup after Demucs separation
-    import gc
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # 2. Whisper Transcription
+    # -------------------------------------------------------------
+    # STAGE 2: TRANSCRIPTION & ALIGNMENT
+    # -------------------------------------------------------------
     yield (
         "STAGE 2/4: SPEECH ALIGNMENT",
-        "Running Faster-Whisper GPU transcription with VAD...",
+        "Checking existing speech boundaries or running Whisper...",
         render_hud_html("0/0", f"{time.time() - start_time:.1f}s", get_vram_usage(), aspect_label),
-        "Inferring sentence timestamps...",
+        "Synchronizing phonetic cues...",
         pd.DataFrame(columns=["Cue", "Timestamp", "Script Segment", "Window", "Duration", "WSOLA", "Peak", "Status"]),
         None, None, None,
         render_wavesurfer_component(""),
         gr.update(choices=[]),
         {},
-        log("Whisper running on CUDA. Extracting speech boundaries...")
+        log("Resolving subtitle alignment boundaries...")
     )
 
     srt_path = str(run_dir / "aligned_subtitles.srt")
-    _, raw_cues = transcribe_video_audio(extracted_audio, srt_path)
-    if not raw_cues:
-        raise gr.Error("No clear dialogue detected in the source video.")
+    cues_json_path = run_dir / "sentence_blocks.json"
 
-    # 3. Sentence Aggregation
-    sentence_blocks = build_sentence_blocks(srt_path)
+    if is_valid_file(cues_json_path) and is_valid_file(srt_path):
+        with open(cues_json_path, "r", encoding="utf-8") as f:
+            sentence_blocks = json.load(f)
+        log(f"[Skipped] Loaded {len(sentence_blocks)} aligned sentence blocks from disk.")
+    else:
+        _, raw_cues = transcribe_video_audio(vocals_stem, srt_path)
+        if not raw_cues:
+            raise gr.Error("No clear dialogue detected in the source video.")
+        sentence_blocks = build_sentence_blocks(srt_path)
+        with open(cues_json_path, "w", encoding="utf-8") as f:
+            json.dump(sentence_blocks, f, indent=2)
+        log(f"[✓] Transcribed and aggregated {len(sentence_blocks)} speech cues.")
+
     total_sentences = len(sentence_blocks)
+    choices = [f"Cue {i+1}: {b['text'][:25]}..." for i, b in enumerate(sentence_blocks)]
 
+    # -------------------------------------------------------------
+    # STAGE 3: CHATTERBOX TTS (Per-Cue Checkpointing)
+    # -------------------------------------------------------------
     yield (
         "STAGE 3/4: ACOUSTIC SYNTHESIS",
-        f"Grouped {len(raw_cues)} fragments into {total_sentences} coherent sentences",
+        f"Checking checkpointed cues for {total_sentences} sentences...",
         render_hud_html(f"0/{total_sentences}", f"{time.time() - start_time:.1f}s", get_vram_usage(), aspect_label),
-        "Conditioning voice profile and locking timbre vectors...",
+        "Conditioning voice profile and synthesizing uncached cues...",
         pd.DataFrame(columns=["Cue", "Timestamp", "Script Segment", "Window", "Duration", "WSOLA", "Peak", "Status"]),
         None, None, None,
         render_wavesurfer_component(""),
-        gr.update(choices=[f"Cue {i+1}: {b['text'][:25]}..." for i, b in enumerate(sentence_blocks)]),
+        gr.update(choices=choices),
         {},
-        log(f"Sanitized room acoustics from '{os.path.basename(selected_voice_path)}'. Conditioning TTS vectors...")
+        log("Synthesizing missing dialogue cues in parallel buffer...")
     )
 
     active_state = {"records": []}
@@ -177,15 +255,15 @@ def run_pipeline(video_file, voice_preset_name, custom_voice_file, temp, exag, c
         active_state["records"] = records
         active_state["latest_yield"] = (
             "STAGE 3/4: ACOUSTIC SYNTHESIS",
-            f"Vocalizing Sentence [{cue_num}/{total_sentences}]",
+            f"Synthesizing [{cue_num}/{total_sentences}]",
             render_hud_html(f"{cue_num}/{total_sentences}", f"{time.time() - start_time:.1f}s", get_vram_usage(), aspect_label),
             f"[{timecode_str}]\n\"{raw_text}\"",
             pd.DataFrame(records),
             preview_path, None, None,
             render_wavesurfer_component(""),
-            gr.update(),
+            gr.update(choices=choices),
             {},
-            log(f"Rendered sentence #{cue_num} ({peak_val} | WSOLA {stretch:.2f}x)")
+            log(f"Sentence #{cue_num} ({peak_val} | WSOLA {stretch:.2f}x)")
         )
 
     def run_synthesis():
@@ -197,6 +275,7 @@ def run_pipeline(video_file, voice_preset_name, custom_voice_file, temp, exag, c
             exaggeration=exag,
             cfg_weight=cfg_w,
             seed=seed_val,
+            cue_cache_dir=cue_cache_dir,
             progress_callback=on_sentence_synthesized
         )
 
@@ -208,37 +287,83 @@ def run_pipeline(video_file, voice_preset_name, custom_voice_file, temp, exag, c
             time.sleep(0.1)
         raw_wav_path, final_records = future.result()
 
-    # -------------------------------------------------------------
-    # STAGE 3.5: AUDIO SUPER-RESOLUTION (24 kHz -> 48 kHz)
-    # -------------------------------------------------------------
-    choices = [f"Cue {i+1}: {b['text'][:25]}..." for i, b in enumerate(sentence_blocks)]
+    records_json_path = run_dir / "records.json"
+    with open(records_json_path, "w", encoding="utf-8") as f:
+        json.dump(final_records, f, indent=2)
 
-    yield (
-        "STAGE 3.5: NEURAL SUPER-RESOLUTION",
-        "Reconstructing 12kHz-20kHz high-frequency studio air with AudioSR...",
-        render_hud_html(f"{total_sentences}/{total_sentences}", f"{time.time() - start_time:.1f}s", get_vram_usage(), aspect_label),
-        "Generating 48kHz high-fidelity vocal harmonics...",
-        pd.DataFrame(final_records),
-        None, None, None,                          # audio, video, srt
-        render_wavesurfer_component(""),           # wavesurfer html
-        gr.update(choices=choices),                # cue dropdown
-        {},                                        # session state
-        log("Engaging AudioSR diffusion model: upscaling voice from 24kHz to 48kHz...")
-    )
-
+    # -------------------------------------------------------------
+    # STAGE 3.5: AUDIOSR SUPER-RESOLUTION (Optional)
+    # -------------------------------------------------------------
     timeline_48k = str(run_dir / "timeline_48k.wav")
-    try:
-        super_resolve_timeline(
-            input_wav=raw_wav_path,
-            output_wav=timeline_48k,
-            seed=seed_val,
-            ddim_steps=20
+    final_audio = raw_wav_path
+
+    if not enable_audiosr:
+        log("[Skipped] AudioSR disabled by user. Retaining 24kHz raw speech.")
+        yield (
+            "STAGE 3.5: SUPER-RESOLUTION (BYPASSED)",
+            "AudioSR neural diffusion bypassed by configuration.",
+            render_hud_html(f"{total_sentences}/{total_sentences}", f"{time.time() - start_time:.1f}s", get_vram_usage(), aspect_label),
+            "Passing 24kHz speech directly to mastering chain...",
+            pd.DataFrame(final_records),
+            None, None, None,
+            render_wavesurfer_component(""),
+            gr.update(choices=choices),
+            {},
+            log("AudioSR bypassed. Proceeding directly to mastering and muxing.")
         )
+    elif is_valid_file(timeline_48k):
         final_audio = timeline_48k
-        log("[✓] AudioSR super-resolution complete (48,000 Hz master produced).")
-    except Exception as e:
-        log(f"[!] AudioSR bypassed due to error ({e}). Proceeding with 24kHz raw audio.")
-        final_audio = raw_wav_path
+        log("[Skipped] Using existing 48kHz AudioSR master timeline.")
+        yield (
+            "STAGE 3.5: NEURAL SUPER-RESOLUTION",
+            "Loaded pre-existing 48,000 Hz timeline from disk.",
+            render_hud_html(f"{total_sentences}/{total_sentences}", f"{time.time() - start_time:.1f}s", get_vram_usage(), aspect_label),
+            "High-frequency 48kHz audio validated.",
+            pd.DataFrame(final_records),
+            None, None, None,
+            render_wavesurfer_component(""),
+            gr.update(choices=choices),
+            {},
+            log("[Skipped] 48kHz AudioSR master previously completed.")
+        )
+    else:
+        audiosr_state = {}
+
+        def on_audiosr_chunk(cur_c, total_c, pct, status_str):
+            audiosr_state["latest_yield"] = (
+                "STAGE 3.5: NEURAL SUPER-RESOLUTION",
+                f"Diffusing AudioSR Chunk [{cur_c}/{total_c}] ({pct:.1f}%)",
+                render_hud_html(f"{total_sentences}/{total_sentences}", f"{time.time() - start_time:.1f}s", get_vram_usage(), aspect_label),
+                status_str,
+                pd.DataFrame(final_records),
+                None, None, None,
+                render_wavesurfer_component(""),
+                gr.update(choices=choices),
+                {},
+                log(f"[AudioSR] Chunk {cur_c}/{total_c} ({pct:.1f}%) -> {status_str}")
+            )
+
+        def run_audiosr_task():
+            return super_resolve_timeline(
+                input_wav=raw_wav_path,
+                output_wav=timeline_48k,
+                seed=seed_val,
+                ddim_steps=20,
+                telemetry_callback=on_audiosr_chunk
+            )
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                sr_future = executor.submit(run_audiosr_task)
+                while not sr_future.done():
+                    if "latest_yield" in audiosr_state:
+                        yield audiosr_state["latest_yield"]
+                    time.sleep(0.15)
+                final_audio = sr_future.result()
+            log("[✓] AudioSR super-resolution complete (48,000 Hz master produced).")
+        except Exception as e:
+            log(f"[!] AudioSR bypassed due to error ({e}). Using 24kHz raw speech.")
+            final_audio = raw_wav_path
 
     # -------------------------------------------------------------
     # STAGE 4: MASTERING & MUXING
@@ -249,40 +374,56 @@ def run_pipeline(video_file, voice_preset_name, custom_voice_file, temp, exag, c
         render_hud_html(f"{total_sentences}/{total_sentences}", f"{time.time() - start_time:.1f}s", get_vram_usage(), aspect_label),
         "Rendering web-compatible MP4 container...",
         pd.DataFrame(final_records),
-        None, None, None,                          # audio, video, srt
-        render_wavesurfer_component(""),           # wavesurfer html
-        gr.update(choices=choices),                # cue dropdown
-        {},                                        # session state
-        log("Mastering 48kHz audio buffer and engaging universal H.264 muxer...")
+        None, None, None,
+        render_wavesurfer_component(""),
+        gr.update(choices=choices),
+        {},
+        log("Mastering audio buffers and muxing final video container...")
     )
 
     if apply_eq:
         mastered_wav = str(run_dir / "timeline_mastered.wav")
-        apply_broadcast_mastering(final_audio, mastered_wav)
+        if not is_valid_file(mastered_wav):
+            apply_broadcast_mastering(final_audio, mastered_wav)
+            log("[✓] Broadcast mastering applied (-14 LUFS).")
+        else:
+            log("[Skipped] Mastered timeline audio already exists.")
         final_audio = mastered_wav
 
-    # Bed over background audio stem if extracted in Step 1
-    if "bg_stem" in locals() and os.path.exists(bg_stem):
-        mixed_master = str(run_dir / "master_mixed_timeline.wav")
-        final_audio = mix_voice_with_background(final_audio, bg_stem, mixed_master)
+    if is_valid_file(bg_stem):
+        bg_data, _ = sf.read(bg_stem, dtype="float32")
+        bg_rms = np.sqrt(np.mean(bg_data ** 2))
+        
+        # If RMS is above -45 dBFS, genuine music or ambiance is present
+        if bg_rms > 0.005:
+            mixed_master = str(run_dir / "master_mixed_timeline.wav")
+            if not is_valid_file(mixed_master):
+                final_audio = mix_voice_with_background(final_audio, bg_stem, mixed_master)
+                log("[✓] Mixed voice with original background music stem.")
+            else:
+                final_audio = mixed_master
+        else:
+            log("[Skipped] Video has no background music; skipping Demucs stem mix.")
 
     final_video = str(run_dir / "final_mastered.mp4")
-    mux_video_universal(video_path, final_audio, final_video)
+    if not is_valid_file(final_video):
+        mux_video_universal(video_path, final_audio, final_video)
+        log(f"[✓] Final video muxed to {final_video}")
+    else:
+        log("[Skipped] Master video container already built.")
 
     total_elapsed = f"{time.time() - start_time:.1f}s"
-    
-    # Store session state for single-cue inspector
     session_data = {
         "run_dir": str(run_dir),
         "sentence_blocks": sentence_blocks,
         "records": final_records,
         "ref_audio": selected_voice_path,
         "video_path": video_path,
-        "apply_eq": apply_eq
+        "apply_eq": apply_eq,
     }
 
     # -------------------------------------------------------------
-    # SYSTEM IDLE: COMPLETE (12 Output Slots)
+    # SYSTEM IDLE: COMPLETE (12 Components Active)
     # -------------------------------------------------------------
     yield (
         "SYSTEM IDLE: COMPLETE",
@@ -294,7 +435,7 @@ def run_pipeline(video_file, voice_preset_name, custom_voice_file, temp, exag, c
         render_wavesurfer_component(f"/file={os.path.abspath(final_audio)}"),
         gr.update(choices=choices, value=choices[0] if choices else None),
         session_data,
-        log(f"Render complete. All assets written to {run_dir.resolve()}")
+        log(f"Render complete. Workspace ready at {run_dir.resolve()}")
     )
 
 
@@ -302,12 +443,27 @@ def run_pipeline(video_file, voice_preset_name, custom_voice_file, temp, exag, c
 with gr.Blocks(title="Neural Studio DAW") as demo:
     gr.HTML(render_header_html())
 
-    # Persistent session state for single cue patching
     session_state = gr.State({})
 
     with gr.Row():
         # LEFT CONTROL RACK
         with gr.Column(scale=4):
+            with gr.Group():
+                gr.Markdown("##### ⚙️ WORKSPACE & CHECKPOINTING")
+                run_mode = gr.Radio(
+                    choices=["New Run", "Resume Existing Run"],
+                    value="New Run",
+                    label="Pipeline Execution Mode"
+                )
+                saved_runs = scan_saved_runs()
+                run_selector = gr.Dropdown(
+                    choices=saved_runs,
+                    value=saved_runs[0] if saved_runs else None,
+                    label="📂 Select Workspace to Resume",
+                    interactive=True,
+                    visible=False
+                )
+
             with gr.Group():
                 gr.Markdown("##### 🎛️ MEDIA INGEST")
                 video_input = gr.File(
@@ -348,7 +504,9 @@ with gr.Blocks(title="Neural Studio DAW") as demo:
                 with gr.Row():
                     cfg_slider = gr.Slider(0.3, 1.5, value=DEFAULT_CFG_WEIGHT, step=0.05, label="CFG Weight (Voice Clamp)")
                     seed_ctrl = gr.Number(value=DEFAULT_SEED, precision=0, label="Anchor Seed")
-                eq_toggle = gr.Checkbox(value=True, label="Engage Broadcast Mastering Chain (-14 LUFS)")
+                with gr.Row():
+                    eq_toggle = gr.Checkbox(value=True, label="Broadcast Mastering (-14 LUFS)")
+                    audiosr_toggle = gr.Checkbox(value=False, label="AudioSR 48kHz Super-Res (Slower)")
 
             run_btn = gr.Button("⚡ INITIATE DUBBING PIPELINE", variant="primary", size="lg", elem_id="primary-dub-btn")
 
@@ -359,18 +517,16 @@ with gr.Blocks(title="Neural Studio DAW") as demo:
                 operation_sub = gr.Textbox(label="ACTIVE TASK", value="Standing by for video input", scale=3)
 
             hud_display = gr.HTML(render_hud_html())
-
-            # Embedded WaveSurfer DAW Canvas
             wavesurfer_box = gr.HTML(render_wavesurfer_component(""))
 
             teleprompter = gr.Textbox(
-                label="🗣️ REAL-TIME SUBTITLE TELEPROMPTER",
+                label="🗣️ REAL-TIME SUBTITLE TELEPROMPTER & TELEMETRY",
                 value="No subtitle cues currently active.",
                 lines=2,
                 elem_id="teleprompter-box"
             )
 
-            # IN-PLACE CUE INSPECTOR (Selective Re-Synthesis)
+            # IN-PLACE CUE INSPECTOR
             with gr.Group(elem_classes="editor-panel"):
                 gr.Markdown("##### 🎛️ IN-PLACE CUE INSPECTOR & RE-SYNTHESIZER")
                 with gr.Row():
@@ -411,6 +567,16 @@ with gr.Blocks(title="Neural Studio DAW") as demo:
             output_video_player = gr.Video(label="🏆 MASTERED PRESENTATION", interactive=False, elem_classes="video-preview-wrapper")
 
     # --- Callbacks ---
+    def on_run_mode_change(mode):
+        dirs = scan_saved_runs()
+        return gr.update(visible=(mode == "Resume Existing Run"), choices=dirs, value=dirs[0] if dirs else None)
+
+    run_mode.change(
+        fn=on_run_mode_change,
+        inputs=[run_mode],
+        outputs=[run_selector]
+    )
+
     def refresh_dropdown():
         voices = scan_voice_presets()
         val = voices[0] if voices else None
@@ -427,7 +593,6 @@ with gr.Blocks(title="Neural Studio DAW") as demo:
         outputs=voice_preview_player
     )
 
-    # Cue Selector Change -> Populate Text Editor
     def on_cue_selected(selected_choice, state):
         if not selected_choice or "sentence_blocks" not in state:
             return "", ""
@@ -442,7 +607,6 @@ with gr.Blocks(title="Neural Studio DAW") as demo:
         outputs=[cue_text_editor, cue_timecode_info]
     )
 
-    # Selective Re-Synthesis Callback
     def on_patch_cue(cue_choice, new_text, c_temp, c_cfg, c_seed, state):
         if not cue_choice or "run_dir" not in state:
             raise gr.Error("No active run available to patch. Complete a generation run first.")
@@ -464,12 +628,10 @@ with gr.Blocks(title="Neural Studio DAW") as demo:
             apply_eq=state["apply_eq"]
         )
 
-        # Update records in state & table
         records = state["records"]
         records[cue_idx - 1] = updated_record
         state["records"] = records
 
-        # Update dropdown list with new text snippet
         new_choices = [f"Cue {i+1}: {b['text'][:25]}..." for i, b in enumerate(state["sentence_blocks"])]
         active_choice = new_choices[cue_idx - 1]
 
@@ -502,6 +664,8 @@ with gr.Blocks(title="Neural Studio DAW") as demo:
     run_btn.click(
         fn=run_pipeline,
         inputs=[
+            run_mode,
+            run_selector,
             video_input,
             voice_dropdown,
             voice_upload_input,
@@ -510,6 +674,7 @@ with gr.Blocks(title="Neural Studio DAW") as demo:
             cfg_slider,
             seed_ctrl,
             eq_toggle,
+            audiosr_toggle,
         ],
         outputs=[
             status_header,
